@@ -1,6 +1,6 @@
 # Elektron Net: `elektron-net-coldwallet` Signer Architecture Guideline
 
-- **Version:** 0.1 (draft)
+- **Version:** 0.2 (draft)
 - **Date:** October 25, 2026
 - **Audience:** Firmware developers, security reviewers, wallet integrators, release engineers
 - **Authors:** Elektron Net Developers, Ali Kutlusoy ([@kutlusoy](https://x.com/kutlusoy))
@@ -16,7 +16,7 @@ Requirement levels follow common practice: **MUST** = mandatory for correct/safe
 
 ## 1. Scope and Decisions
 
-`elektron-net-coldwallet` is an air-gapped signing device for Elektron Net (ELEK). It generates and holds the private keys, shows receive addresses and the account descriptor, and signs transactions. All communication with the outside world uses QR codes, plus a microSD card for firmware images.
+`elektron-net-coldwallet` is an air-gapped device for Elektron Net (ELEK). It generates and holds the private keys, shows receive addresses and the account descriptor, and signs transactions. All communication with the outside world uses QR codes, plus a microSD card for firmware images. Delivery is phased (§13): key custody and watch-only export first, signing second.
 
 Decisions of October 25, 2026:
 
@@ -28,7 +28,10 @@ Decisions of October 25, 2026:
 | D4 | Derivation: SLIP-44 coin type `1370'` only. The legacy `0'` path is not supported |
 | D5 | The device holds keys in two modes: persistent (encrypted on the SD card) and stateless (seed entered per session) |
 | D6 | Repository language: English |
-| D7 | Hardware-wallet compatibility with the node wallet (`elektrond`) and `elektron-net-mobile` is a design requirement from the first release |
+| D7 | Compatibility with the node wallet (`elektrond`) and `elektron-net-mobile` is a design requirement from the first release |
+| D8 | Default address type is native SegWit (P2WPKH, `be1q...`, `m/84'/1370'/0'`), the same as the node wallet and `elektron-net-mobile`. Taproot is optional |
+| D9 | Signing uses PSBT (BIP-174), the standard already supported by the node and `elektron-net-mobile` |
+| D10 | Phased delivery: custody and watch-only export (Phase 1), then PSBT signing (Phase 2) |
 
 Non-goals of v1: Lightning, Bluetooth or NFC transport, smart-card or secure-element support, closed-source components, support for other chains.
 
@@ -41,6 +44,7 @@ Non-goals of v1: Lightning, Bluetooth or NFC transport, smart-card or secure-ele
 | Weak or backdoored randomness | Yes | Hardware RNG, camera and dice entropy are mixed, health tests run, no fallback to weak sources (§4.1) |
 | Theft of the device or SD card | Yes | Seed encrypted with a passphrase-derived key (§4.2), stateless mode available |
 | Tampered firmware image | Yes | Signed images, hash shown on screen, reproducible build (§9) |
+| Coordinator that understates input amounts across several signing rounds | Yes | Session guard and fee display (§7) |
 | Evil maid with physical access and hardware tools | Partly | The Pi Zero has no secure element and no verified boot. Tamper evidence and stateless mode reduce the risk, they do not remove it |
 | Side channels and fault injection against the SoC | No | Out of scope without a secure element |
 
@@ -76,6 +80,8 @@ Availability of the Pi Zero v1.3 is limited. Alternative boards are only accepta
 - **MUST:** the encrypted blob lives on a data partition of the SD card, the system partition is read-only at runtime.
 - **MUST:** keys exist in RAM only while needed, and are overwritten before power off or return to the main menu.
 - **SHOULD:** the optional BIP-39 passphrase (25th word) is never stored.
+
+Upstream SeedSigner persists only settings on the SD card, never seeds. The encrypted seed store is new code.
 
 ### 4.3 Stateless mode
 
@@ -113,19 +119,28 @@ Because xpub and WIF encodings are byte-identical to Bitcoin, the device cannot 
 
 | Purpose | Path | Notes |
 |---|---|---|
-| Native SegWit single-sig (default) | `m/84'/1370'/0'` | `wpkh()`, receive `/0/*`, change `/1/*` |
-| Taproot single-sig | `m/86'/1370'/0'` | `tr()`, SHOULD be supported |
+| Native SegWit single-sig (default) | `m/84'/1370'/0'` | `wpkh()`, receive `/0/*`, change `/1/*`. MUST be supported and is the default |
+| Multisig / escrow key | `m/48'/1370'/<a>'/2'` | P2WSH, identical to `elektron-net-mobile` escrow (§2.1 of its guideline). SHOULD be supported |
+| Taproot single-sig | `m/86'/1370'/0'` | `tr()`, MAY be supported, never the default |
 | Nested SegWit, legacy | `m/49'/1370'`, `m/44'/1370'` | MAY be supported, discouraged by the UI |
-| Multisig / escrow key | `m/48'/1370'/<a>'/2'` | P2WSH, identical to `elektron-net-mobile` escrow (§2.1 of its guideline) |
 
 - **MUST:** coin type `1370'` on mainnet. A PSBT that carries key origin paths with another coin type for the user's own inputs or change MUST be rejected with an explicit message.
 - The legacy `0'` path is not supported, which is safe because the device only holds seeds created on it.
 
 ### 5.3 Changes to the SeedSigner code base
 
-- Add an Elektron Net network definition to the underlying key library (HRP, version bytes, coin type) and set it as the only mainnet.
-- Adapt the change-output check, which compares derivation paths against the coin type, to `1370'`.
-- Replace currency strings and fee display (ELEK, lepton, lep/vB).
+Findings from a review of upstream `main` (commit `d8f7956`, October 23, 2026):
+
+| Area | Upstream behaviour | Change for Elektron Net |
+|---|---|---|
+| Coin type | `src/seedsigner/helpers/embit_utils.py`, `get_standard_derivation_path()` hardcodes `0'` (mainnet) and `1'` (testnet, regtest) | Mainnet to `1370'` for BIP-44/49/84/86 and BIP-48 |
+| Coin type check in PSBTs | The parser (`models/psbt_parser.py`) detects own change by rebuilding the script from the seed's keys and does not compare the coin type | New check for C7 |
+| Network definition | Comes from `embit` (`NETWORKS`, pinned `embit==0.8.0`), mapped in `models/settings_definition.py` (`map_network_to_embit`) | Provide an Elektron mainnet entry (HRP `be`) by patching at start-up or by forking `embit`, see Q2 |
+| Address recognition | `models/decode_qr.py` matches only `bc1`, `tb1`, `bcrt` prefixes (lines 519, 1016, 1042, 1054) | Add `be1`, `be1q`, `be1p` |
+| Networks offered | Mainnet, testnet, regtest selectable in settings | Fix mainnet to Elektron Net, mark testnet visibly |
+| Persistence | Settings only | Encrypted seed store, new code (§4.2) |
+| Currency | Bitcoin units and strings | ELEK, lepton, lep/vB |
+
 - Remove or hide any feature that depends on an online service.
 - Keep all changes small and rebase-friendly, and keep upstream license and notices unchanged. Add "Elektron Net Developers" as additional attribution where the MIT license allows.
 
@@ -151,6 +166,8 @@ Signer:               scan  ->  parse  ->  verify  ->  confirm  ->  sign  ->  sh
 Mobile:               scan  ->  finalizepsbt  ->  sendrawtransaction
 ```
 
+PSBT is used because the device needs the input amounts, scripts and key origins to verify and display a transaction. A raw unsigned transaction does not carry them, and signing without them is blind signing.
+
 The device **MUST** display, before any signature, for the exact file that is signed:
 
 1. Every output with its full address (in pages if needed) and its amount in ELEK.
@@ -161,7 +178,19 @@ The device **MUST** display, before any signature, for the exact file that is si
 
 The device **MUST** reject a PSBT when: an output address is not valid for HRP `be`, the sum of inputs minus outputs does not match the stated fee, an input amount cannot be determined, or the key origin of an own input does not match the loaded seed.
 
-**Pruned network consideration:** Elektron Net nodes keep only about 137 days of blocks. A previous full transaction (`non_witness_utxo`) may therefore not be obtainable for older coins. The firmware **MUST** accept SegWit inputs that carry only `witness_utxo`, and **MUST** verify amounts from it. Taproot inputs commit to all input amounts in the signature hash and need no previous transaction.
+### 7.1 Input amounts on a pruned network
+
+Elektron Net nodes keep only about 137 days of blocks, so a previous full transaction (`non_witness_utxo`) may not be obtainable for older coins. Upstream SeedSigner already accepts SegWit inputs (P2WPKH, P2WSH, nested SegWit, Taproot) that carry only `witness_utxo`, and rejects only legacy inputs without `non_witness_utxo` (`psbt_parser.py`, `UNCOMMITTED_AMOUNT_SCRIPT_TYPES`). When both fields are present, it hashes the previous transaction and compares it with `witness_utxo`.
+
+The firmware **MUST** keep this behaviour.
+
+### 7.2 Residual risk for SegWit v0 (CVE-2020-14199)
+
+For SegWit v0 inputs the signature hash commits only to the amount of the input being signed. A compromised coordinator can ask for several signing rounds of the same transaction and understate different inputs in each round, then combine the signatures into a transaction with a much higher real fee. Upstream accepts this risk. Taproot is not affected, because BIP-341 commits all input amounts. Since P2WPKH is the default address type here, the following mitigations apply:
+
+1. **SHOULD:** `elektron-net-mobile` includes `non_witness_utxo` in the PSBT whenever the node still has the previous transaction. The device then verifies the hash.
+2. **SHOULD:** a session guard. The device keeps in RAM, for the current session only, the unsigned transaction id and the declared input amounts of every PSBT it signed. If the same transaction is presented again with different amounts, the device warns and refuses. Nothing is written to disk, so this works in stateless mode.
+3. **MUST:** the fee is shown for every signing round (C5).
 
 ## 8. Compatibility
 
@@ -184,19 +213,20 @@ Present today: PSBT check, sign, combine, finalize and broadcast (`PsbtTools.kt`
 
 Gaps to close in `elektron-net-mobile` (tracked there, listed here as dependencies):
 
-| # | Gap | Reference |
-|---|---|---|
-| G1 | Animated QR encode and decode for PSBTs | Escrow guideline E2 (Phase 4) |
-| G2 | Watch-only wallet type created from a scanned device descriptor | Not in the feature list yet |
-| G3 | Send flow for watch-only wallets: show PSBT as QR, scan the signed PSBT, finalize, broadcast | Building blocks exist in `PsbtTools.kt` |
-| G4 | Hardware and air-gapped signer as escrow participant | Escrow guideline E3 (Phase 5) |
-| G5 | Interoperability tests with an external signer | Escrow guideline checklist |
+| # | Gap | Phase | Reference |
+|---|---|---|---|
+| G1 | Animated QR encode and decode for PSBTs | 2 | Escrow guideline E2 (Phase 4) |
+| G2 | Watch-only wallet type created from a scanned device descriptor | 1 | Not in the feature list yet |
+| G3 | Send flow for watch-only wallets: show PSBT as QR, scan the signed PSBT, finalize, broadcast | 2 | Building blocks exist in `PsbtTools.kt` |
+| G4 | Hardware and air-gapped signer as escrow participant | 3 | Escrow guideline E3 (Phase 5) |
+| G5 | Interoperability tests with an external signer | 3 | Escrow guideline checklist |
+| G6 | Include `non_witness_utxo` in PSBTs when available | 2 | See §7.2 |
 
 Both repositories MUST agree on one animated QR format before either implements it. Candidates are the UR2 `crypto-psbt` format and BBQr. The choice is an open question (§12).
 
 ### 8.3 `elektron-net-electrum`
 
-The Electrum fork keeps `m/0'` for its own native seeds and is not compatible with the `1370'` rule of this device. It can still import the device descriptor as a watch-only wallet and exchange PSBTs, which makes it a possible first offline-signing path before `elektron-net-mobile` supports watch-only wallets. This needs verification.
+The Electrum fork keeps `m/0'` for its own native seeds and is not compatible with the `1370'` rule of this device. It is not part of the plan.
 
 ## 9. Firmware Distribution and Updates
 
@@ -219,17 +249,18 @@ The Electrum fork keeps `m/0'` for its own native seeds and is not compatible wi
 | C5 | Every signature is preceded by the full on-device verification screen (§7) | MUST |
 | C6 | Chain, symbol and HRP are fixed in the build and shown on confirmation screens | MUST |
 | C7 | Coin type `1370'` only, other coin types for own keys are rejected | MUST |
-| C8 | `witness_utxo` only SegWit inputs are accepted and amounts verified | MUST |
+| C8 | SegWit inputs with `witness_utxo` only are accepted and amounts verified, legacy inputs without `non_witness_utxo` are rejected | MUST |
 | C9 | Signed images, reproducible build, hash shown on screen | MUST |
 | C10 | No logging of seeds, keys, PSBTs or addresses to disk | MUST |
 | C11 | Stateless mode available and recommended for high-value storage | SHOULD |
 | C12 | Independent security review before the first stable release | MUST |
+| C13 | Session guard against repeated signing of one transaction with changing input amounts (§7.2) | SHOULD |
 
 ## 11. Test Plan
 
-- **Unit tests:** network definition (addresses, HRP, WIF), derivation vectors for `84'/1370'/0'`, `86'/1370'/0'` and `48'/1370'/a'/2'`, entropy health tests with injected faults.
-- **Interoperability against a regtest `elektrond`:** create a watch-only wallet from the device descriptor, fund it, create a PSBT with `walletcreatefundedpsbt`, sign on the device (simulator and real hardware), finalize and broadcast. Cover SegWit v0 inputs with and without `non_witness_utxo`, Taproot inputs, change detection, multi-input PSBTs that need animated QR.
-- **Negative tests:** wrong HRP, wrong coin type, fee mismatch, missing amounts, malformed QR, oversized PSBT.
+- **Unit tests:** network definition (addresses, HRP, WIF), derivation vectors for `84'/1370'/0'`, `48'/1370'/a'/2'` and, if supported, `86'/1370'/0'`, entropy health tests with injected faults.
+- **Interoperability against a regtest `elektrond`:** create a watch-only wallet from the device descriptor, fund it, create a PSBT with `walletcreatefundedpsbt`, sign on the device (simulator and real hardware), finalize and broadcast. Cover P2WPKH inputs with and without `non_witness_utxo`, change detection, multi-input PSBTs that need animated QR.
+- **Negative tests:** wrong HRP, wrong coin type, fee mismatch, missing amounts, legacy input without `non_witness_utxo`, mismatching `witness_utxo` and `non_witness_utxo`, malformed QR, oversized PSBT, repeated signing with changed amounts.
 - **Mobile:** end-to-end send from `elektron-net-mobile` once gaps G1 to G3 are closed.
 - **Hardware:** radio absence check, power analysis of boot, and the verification procedure for images.
 
@@ -237,22 +268,78 @@ The Electrum fork keeps `m/0'` for its own native seeds and is not compatible wi
 
 | # | Question | Recommendation |
 |---|---|---|
-| Q1 | Animated QR format: UR2 `crypto-psbt` or BBQr? | Decide together with `elektron-net-mobile` before Phase 1 ends. Pick the format the SeedSigner code base already supports, to keep the fork small |
-| Q2 | Does upstream SeedSigner accept `witness_utxo` only SegWit v0 PSBTs? | Verify in the code. If not, add support (C8) |
+| Q1 | Animated QR format: UR2 `crypto-psbt` or BBQr? | Decide together with `elektron-net-mobile` before Phase 2 starts. Pick the format the SeedSigner code base already supports, to keep the fork small |
+| Q2 | Elektron mainnet in `embit`: patch `NETWORKS` at start-up or fork `embit`? | Check how `NETWORKS` is structured in `embit` 0.8.0. A start-up patch keeps the dependency pinned and the fork small |
 | Q3 | Replacement for the Pi Zero v1.3 when it is no longer available | Evaluate boards with the same properties. A radio that is merely disabled in software is a weaker option |
 | Q4 | Minimum passphrase length and KDF cost | Define after benchmarks on the Pi Zero |
 | Q5 | Testnet HRP collision with Bitcoin testnet | Assign a dedicated testnet HRP in the node, then update this device |
 | Q6 | Offer a smart-card or secure-element upgrade path later | Not for v1 |
 
-## 13. Checklist
+## 13. Phase Plan
+
+### Phase 0: Interim path without new hardware (optional)
+
+An offline computer running `elektrond` with a wallet created from a BIP-39 seed (descriptors with `1370h`) signs PSBTs received as files or QR codes. This needs no development, but a general purpose computer is a weaker security device than the target hardware. It is a stop-gap for early users.
+
+### Phase 1: Key custody and watch-only export
+
+Scope:
+
+- Fork SeedSigner, add the Elektron Net network definition, `1370'` derivation, `be1` address recognition, ELEK/lepton strings (§5.3).
+- Seed generation with mixed entropy and health tests (§4.1), encrypted persistent store and stateless mode (§4.2, §4.3), backup flow (§4.4).
+- Show receive addresses and the account descriptor as QR (§6), with address verification on the device.
+- PSBT signing is present in the code base but disabled by a build flag in Phase 1 releases.
+- `elektron-net-mobile`: watch-only wallet from a scanned descriptor (G2).
+
+Spending in Phase 1 is only possible by restoring the seed in a hot wallet, which makes that seed hot. The documentation MUST say so and MUST instruct users to move all funds to a new seed after such a spend.
+
+Exit criteria: derivation and address test vectors pass, entropy health tests pass with injected faults, a watch-only wallet in the node (regtest) tracks funds sent to device addresses.
+
+### Phase 2: PSBT signing
+
+Scope:
+
+- Enable signing with the verification screen and rejection rules of §7, the Elektron coin type check (C7), the session guard (C13).
+- Animated QR transport (G1) in both repositories, send flow for watch-only wallets (G3), `non_witness_utxo` inclusion (G6).
+- Regtest interoperability tests with `elektrond` and end-to-end tests with `elektron-net-mobile`.
+
+Exit criteria: all tests of §11 pass on real hardware, including negative tests.
+
+### Phase 3: Hardening and release
+
+- Reproducible build, signed images, user verification guide (§9).
+- Independent security review (C12).
+- Escrow participation (G4) and interoperability tests (G5).
+
+### Phase 4: Optional extensions
+
+- Secure element or alternative boards (Q3, Q6).
+- Taproot single-sig and further script types.
+
+## 14. Checklist
+
+Phase 1
 
 - [ ] Fork SeedSigner and add the Elektron Net network definition
-- [ ] Derivation paths and change detection for coin type `1370'`
+- [ ] Derivation paths for coin type `1370'`
+- [ ] `be1` address recognition in QR decoding
 - [ ] Persistent encrypted seed storage and stateless mode
 - [ ] Entropy mixing with hardware RNG, camera, dice, and health tests
-- [ ] Animated QR format agreed with `elektron-net-mobile`
+- [ ] Descriptor and address QR display
+- [ ] Build flag that disables signing
+- [ ] `elektron-net-mobile` watch-only import (G2)
+
+Phase 2
+
+- [ ] Coin type check in the PSBT parser
 - [ ] On-device verification screen (§7)
-- [ ] Signed, reproducible release images and user verification guide
+- [ ] Session guard (§7.2)
+- [ ] Animated QR format agreed and implemented on both sides (G1)
+- [ ] Watch-only send flow in `elektron-net-mobile` (G3, G6)
 - [ ] Regtest interoperability tests with `elektrond`
-- [ ] `elektron-net-mobile` gaps G1 to G3 closed
+
+Phase 3
+
+- [ ] Signed, reproducible release images and user verification guide
 - [ ] Independent security review
+- [ ] Escrow participation and interoperability tests (G4, G5)
